@@ -2,67 +2,140 @@ import boto3
 import email
 import email.utils
 import logging
-import base64
 import os
+import base64
 from urllib.parse import unquote_plus
 from datetime import datetime
+
+# Configurar logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def extract_email(from_header):
     """Extracts the email address from the 'From' header."""
     name, email_address = email.utils.parseaddr(from_header)
     return email_address
 
-def decode_filename_and_extension(encoded_filename):
-    """Decodes the file name and gets the clean extension"""
-    try:
-        # Decode the file name
-        decoded_parts = email.header.decode_header(encoded_filename)
-        filename_parts = []
-        for part, charset in decoded_parts:
-            if isinstance(part, bytes):
-                if charset:
-                    filename_parts.append(part.decode(charset))
-                else:
-                    filename_parts.append(part.decode())
-            else:
-                filename_parts.append(part)
-        
-        decoded_filename = ''.join(filename_parts)
-        # Get the extension from the decoded name
-        _, extension = os.path.splitext(decoded_filename)
-        return extension[1:].lower() if extension else ''
-    except Exception as e:
-        logging.error(f"Error decoding file name: {str(e)}")
-        return ''
+def extract_html_with_embedded_images(msg):
+    """
+    Extrae el cuerpo HTML y procesa imágenes incrustadas preservando el formato
+    """
+    html_body = None
+    embedded_images = {}
 
-def get_attachments_info(msg):
-    """Extracts information about all attachments in the email."""
-    attachments = []
-    
+    # Lista de codificaciones a intentar (ordenadas de más general a más específica)
+    encodings = [
+        'utf-8', 'utf-8-sig',  # UTF-8 primero
+        'cp1252',  # Windows
+        'latin-1', 'iso-8859-1', 'iso-8859-15',  # Latín
+        'ascii'  # Último recurso
+    ]
+
+    # Función auxiliar para intentar decodificar
+    def safe_decode(payload, encodings_to_try):
+        for encoding in encodings_to_try:
+            try:
+                # Intentar decodificar con la codificación actual
+                decoded = payload.decode(encoding)
+                logger.info(f"Decodificación exitosa con {encoding}")
+                return decoded
+            except (UnicodeDecodeError, LookupError):
+                continue
+        
+        # Si ninguna codificación funciona, usar decodificación con reemplazo
+        try:
+            return payload.decode('utf-8', errors='replace')
+        except Exception:
+            # Último recurso: decodificación forzada
+            return payload.decode('latin-1')
+
+    # Buscar cuerpo HTML
     for part in msg.walk():
-        if part.get_content_maintype() == 'multipart':
-            continue
+        if part.get_content_type() == 'text/html':
+            # Obtener payload
+            payload = part.get_payload(decode=True)
             
-        filename = part.get_filename()
-        if filename:
-            # Use the new function to get the clean extension
-            extension = decode_filename_and_extension(filename)
-            attachments.append({
-                'filename': filename,
-                'extension': extension,
-                'part': part
-            })
+            # Intentar decodificar
+            html_body = safe_decode(payload, encodings)
+            break
     
-    return attachments
+    # Si no hay HTML, buscar texto plano
+    if not html_body:
+        for part in msg.walk():
+            if part.get_content_type() == 'text/plain':
+                # Obtener payload
+                payload = part.get_payload(decode=True)
+                
+                # Intentar decodificar
+                plain_text = safe_decode(payload, encodings)
+                
+                # Convertir texto plano a HTML simple
+                html_body = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                </head>
+                <body>
+                    <pre>{plain_text}</pre>
+                </body>
+                </html>
+                """
+                break
+
+    # Procesar imágenes incrustadas
+    if html_body:
+        for part in msg.walk():
+            if part.get_content_maintype() == 'image':
+                # Obtener Content-ID o nombre de archivo
+                content_id = part.get('Content-ID', '').strip('<>')
+                filename = part.get_filename()
+
+                # Decodificar imagen
+                image_data = part.get_payload(decode=True)
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                mime_type = part.get_content_type()
+
+                # Generar identificador único
+                img_key = content_id or filename or f'image_{len(embedded_images)}'
+
+                # Guardar imagen
+                embedded_images[img_key] = {
+                    'data': image_base64,
+                    'mime_type': mime_type,
+                    'filename': filename or img_key
+                }
+
+        # Reemplazar referencias de imágenes
+        for key, img_info in embedded_images.items():
+            # Reemplazar referencias de Content-ID o nombre de archivo
+            html_body = html_body.replace(f'cid:{key}', 
+                f'data:{img_info["mime_type"]};base64,{img_info["data"]}')
+            html_body = html_body.replace(key, 
+                f'data:{img_info["mime_type"]};base64,{img_info["data"]}')
+
+    # Agregar encabezado HTML si no existe
+    if not html_body.strip().lower().startswith('<!doctype') and not html_body.strip().lower().startswith('<html'):
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+        </head>
+        <body>
+            {html_body}
+        </body>
+        </html>
+        """
+
+    return html_body
 
 def lambda_handler(event, context):
     s3 = boto3.client("s3")
 
-    # Set up logging
+    # Configurar logging
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-
-    ALLOWED_EXTENSIONS = {'docx', 'csv', 'html', 'txt', 'pdf', 'md', 'doc', 'xlsx', 'xls'}
 
     if event: 
         print("My Event is : ", event)
@@ -73,66 +146,55 @@ def lambda_handler(event, context):
 
         file_key_original = unquote_plus(filename)
         logger.info(f"File name: {file_key_original}")
-        fileObj = s3.get_object(Bucket = bucket_name, Key=file_key_original)
         
+        # Obtener el objeto del archivo EML
+        fileObj = s3.get_object(Bucket=bucket_name, Key=file_key_original)
+        
+        # Convertir a objeto de mensaje de correo
         msg = email.message_from_bytes(fileObj['Body'].read())
+        
+        # Extraer información del remitente
         email_from = extract_email(msg['From'])
         logger.info(f"From: {email_from}")
 
-        # Get information about all attachments
-        attachments = get_attachments_info(msg)
-
-        # Log information about the found attachments
-        logger.info(f"Attachments found: {len(attachments)}")
-        for att in attachments:
-            logger.info(f"Attachment: {att['filename']} - Extension: {att['extension']}")
-
-        # Filter only the attachments with allowed extensions
-        valid_attachments = [att for att in attachments if att['extension'] in ALLOWED_EXTENSIONS]
-        logger.info(f"Valid attachments: {len(valid_attachments)}")
-
-        # Currently date
-        timestamp = datetime.now().strftime("%Y-%b-%d %H:%M:%S")
-
-        # Process the valid attachments
-        for idx, attachment in enumerate(valid_attachments):
-            # Decode the attachment content
-            file_data = attachment['part'].get_payload(decode=True)
+        # Extraer cuerpo HTML
+        html_body = extract_html_with_embedded_images(msg)
+        
+        if html_body:
+            # Generar marca de tiempo
+            timestamp = datetime.now().strftime("%Y-%b-%d %H:%M:%S")
             
-            # Temporary file path
-            file_path = f'/tmp/{filename}'
-            
-            # Upload the attachment to another bucket 
+            # Bucket de destino
             target_bucket = os.environ['target_bucket']
-                        
+            
             try:
-                # Save the file temporarily
-                with open(file_path, 'wb') as f:
-                    f.write(file_data)
-
-                # Construct the S3 path
-                # If there are multiple valid attachments, add an index to the name
-                if len(valid_attachments) > 1:
-                    s3_path = f"{email_from}/{timestamp}_{idx + 1}.{attachment['extension']}"
-                else:
-                    s3_path = f"{email_from}/{timestamp}.{attachment['extension']}"
+                # Ruta para guardar en S3
+                s3_path = f"{email_from}/{timestamp}.html"
                 
-                # Upload to S3
+                # Guardar en S3
                 s3.put_object(
                     Bucket=target_bucket, 
                     Key=s3_path, 
-                    Body=file_data
+                    Body=html_body,
+                    ContentType='text/html; charset=utf-8'
                 )
 
-                logger.info(f'Attachment processed: {s3_path}')
+                logger.info(f'HTML body processed and saved: {s3_path}')
+                
+                return {
+                    'statusCode': 200,
+                    'body': 'HTML body processed successfully.'
+                }
             
             except Exception as e:
-                logger.error(f'Error processing attachment {attachment["filename"]}: {str(e)}')
-            
-            # Clean up the temporary file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        return {
-            'statusCode': 200,
-            'body': f'Processing completed. {len(valid_attachments)} files processed.'
-        }
+                logger.error(f'Error processing HTML body: {str(e)}')
+                return {
+                    'statusCode': 500,
+                    'body': f'Error processing HTML body: {str(e)}'
+                }
+        else:
+            logger.warning('No HTML body found in the email.')
+            return {
+                'statusCode': 404,
+                'body': 'No HTML body found in the email.'
+            }
