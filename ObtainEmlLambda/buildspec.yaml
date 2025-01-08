@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "No dependencies to install."
+  build:
+    commands:
+      - echo "Packaging Lambda Function: ObtainEMLLambda"
+      - zip -r ObtainEMLLambda.zip ObtainEmlLambda/
+  post_build:
+    commands:
+      - echo "Deploying Lambda Function: ObtainEMLLambda"
+      - aws lambda update-function-code \
+          --function-name ObtainEMLLambda \
+          --zip-file fileb://ObtainEMLLambda.zip
+
+artifacts:
+  files:
+    - ObtainEMLLambda.zip
