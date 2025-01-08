@@ -3,14 +3,19 @@ version: 0.2
 phases:
   install:
     commands:
-      - echo "No dependencies to install."
+      - echo "No dependencies to install for SQS-Bitacoras."
+
   build:
     commands:
       - echo "Packaging Lambda Function: SQS-Bitacoras"
-      - zip -r SQS-Bitacoras.zip SQS-Bitacoras/
+      # Cambiar al directorio específico de la función
+      - cd SQS-Bitacoras
+      # Crear el archivo ZIP para empaquetar la función
+      - zip -r ../SQS-Bitacoras.zip .
   post_build:
     commands:
       - echo "Deploying Lambda Function: SQS-Bitacoras"
+      # Actualizar explícitamente el código de la función Lambda
       - aws lambda update-function-code \
           --function-name SQS-Bitacoras \
           --zip-file fileb://SQS-Bitacoras.zip
@@ -18,4 +23,3 @@ phases:
 artifacts:
   files:
     - SQS-Bitacoras.zip
-
